@@ -27,6 +27,8 @@ go.work.sum
 # env file
 .env
 
-config.toml
-myfeeds.txt
 miniflux-adder
+config.toml
+*.txt
+*.opml
+*.xml
