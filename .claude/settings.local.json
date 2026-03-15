@@ -5,7 +5,8 @@
       "WebFetch(domain:miniflux.app)",
       "Bash(go build:*)",
       "Bash(./miniflux-adder --help)",
-      "Bash(./miniflux-adder 2>&1; echo \"exit: $?\")"
+      "Bash(./miniflux-adder 2>&1; echo \"exit: $?\")",
+      "Bash(golangci-lint run:*)"
     ]
   }
 }

@@ -1,12 +1,11 @@
 package main
 
 import (
-	"bufio"
+	"cmp"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,12 +50,8 @@ type feedResult struct {
 }
 
 type opmlDocument struct {
-	XMLName xml.Name `xml:"opml"`
-	Body    opmlBody `xml:"body"`
-}
-
-type opmlBody struct {
-	Outlines []opmlOutline `xml:"outline"`
+	XMLName  xml.Name      `xml:"opml"`
+	Outlines []opmlOutline `xml:"body>outline"`
 }
 
 type opmlOutline struct {
@@ -101,15 +96,16 @@ func main() {
 		fatal("please provide a feed file path or URL")
 	}
 
-	filePath, cleanup := resolveInput(cli.Input)
-	if cleanup != nil {
-		defer cleanup()
-	}
-
+	data := readInput(cli.Input)
 	isOPML := isOPMLFile(cli.Input)
 	client := miniflux.NewClient(cfg.MinifluxURL, token)
 
-	feeds := loadFeeds(filePath, isOPML, client, cfg)
+	var feeds []feedEntry
+	if isOPML {
+		feeds = loadOPMLFeeds(data, client, cfg)
+	} else {
+		feeds = loadTextFeeds(data, cfg.CategoryID)
+	}
 
 	fmt.Println(headerStyle.Render("miniflux-adder"))
 	fmt.Printf("Adding %d feed(s) to %s\n\n", len(feeds), cfg.MinifluxURL)
@@ -118,8 +114,11 @@ func main() {
 	succeeded, skipped, failed, remainingURLs := tallyResults(results)
 	printSummary(succeeded, skipped, failed)
 
-	if cfg.RemoveAdded && len(remainingURLs) != len(feeds) {
-		handleRemoveAdded(filePath, remainingURLs, isURL(cli.Input), isOPML)
+	if cfg.RemoveAdded && !isOPML && !isURL(cli.Input) && len(remainingURLs) != len(feeds) {
+		if err := writeURLs(cli.Input, remainingURLs); err != nil {
+			fatal("updating %s: %v", cli.Input, err)
+		}
+		fmt.Println(dimStyle.Render(fmt.Sprintf("  Updated %s (%d URLs remaining)", cli.Input, len(remainingURLs))))
 	}
 
 	if failed > 0 {
@@ -138,9 +137,9 @@ func resolveConfig() (config, string) {
 	}
 
 	cfg := config{
-		MinifluxURL:    coalesce(cli.MinifluxURL, os.Getenv("MINIFLUX_URL"), fileCfg.MinifluxURL),
-		APIToken:       coalesce(cli.APIToken, os.Getenv("MINIFLUX_API_TOKEN"), fileCfg.APIToken),
-		OPMLCategories: coalesce(cli.OPMLCategories, os.Getenv("MINIFLUX_OPML_CATEGORIES"), fileCfg.OPMLCategories, "ignore"),
+		MinifluxURL:    cmp.Or(cli.MinifluxURL, os.Getenv("MINIFLUX_URL"), fileCfg.MinifluxURL),
+		APIToken:       cmp.Or(cli.APIToken, os.Getenv("MINIFLUX_API_TOKEN"), fileCfg.APIToken),
+		OPMLCategories: cmp.Or(cli.OPMLCategories, os.Getenv("MINIFLUX_OPML_CATEGORIES"), fileCfg.OPMLCategories, "ignore"),
 		RemoveAdded:    fileCfg.RemoveAdded,
 	}
 
@@ -171,16 +170,6 @@ func resolveConfig() (config, string) {
 	}
 
 	return cfg, token
-}
-
-// coalesce returns the first non-empty string.
-func coalesce(values ...string) string {
-	for _, v := range values {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }
 
 // --- Commands ---
@@ -236,36 +225,27 @@ func addFeeds(client *miniflux.Client, feeds []feedEntry) []feedResult {
 
 // --- Input resolution ---
 
-// resolveInput returns the local file path to read and an optional cleanup function.
-// If the input is a URL, the content is fetched to a temp file.
-func resolveInput(input string) (filePath string, cleanup func()) {
-	if !isURL(input) {
-		return input, nil
+// readInput returns the content of the input as bytes.
+// For local files it reads from disk; for URLs it fetches over HTTP.
+func readInput(input string) []byte {
+	if isURL(input) {
+		fmt.Printf("Fetching %s\n", input)
+		data, err := fetchURL(input)
+		if err != nil {
+			fatal("%v", err)
+		}
+		return data
 	}
 
-	fmt.Printf("Fetching %s\n", input)
-	downloaded, err := fetchToTempFile(input)
+	data, err := os.ReadFile(input)
 	if err != nil {
 		fatal("%v", err)
 	}
-	return downloaded, func() { os.Remove(downloaded) }
+	return data
 }
 
-// loadFeeds reads feeds from the given file path, dispatching to OPML or
-// plain-text parsing. For OPML with opml_categories="create", categories
-// are resolved/created in Miniflux.
-func loadFeeds(filePath string, isOPML bool, client *miniflux.Client, cfg config) []feedEntry {
-	if isOPML {
-		return loadOPMLFeeds(filePath, client, cfg)
-	}
-	return loadTextFeeds(filePath, cfg.CategoryID)
-}
-
-func loadTextFeeds(filePath string, categoryID int64) []feedEntry {
-	urls, err := readURLs(filePath)
-	if err != nil {
-		fatal("%v", err)
-	}
+func loadTextFeeds(data []byte, categoryID int64) []feedEntry {
+	urls := parseURLs(data)
 	if len(urls) == 0 {
 		fatal("no URLs found in file")
 	}
@@ -277,8 +257,8 @@ func loadTextFeeds(filePath string, categoryID int64) []feedEntry {
 	return feeds
 }
 
-func loadOPMLFeeds(filePath string, client *miniflux.Client, cfg config) []feedEntry {
-	opmlFeeds, err := parseOPML(filePath)
+func loadOPMLFeeds(data []byte, client *miniflux.Client, cfg config) []feedEntry {
+	opmlFeeds, err := parseOPML(data)
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -350,8 +330,7 @@ func resolveOPSecret(ref string) (string, error) {
 // --- Input parsing ---
 
 func isURL(s string) bool {
-	u, err := url.Parse(s)
-	return err == nil && (u.Scheme == "http" || u.Scheme == "https")
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
 func isOPMLFile(path string) bool {
@@ -359,66 +338,37 @@ func isOPMLFile(path string) bool {
 	return ext == ".opml" || ext == ".xml"
 }
 
-func fetchToTempFile(rawURL string) (string, error) {
+func fetchURL(rawURL string) ([]byte, error) {
 	resp, err := http.Get(rawURL)
 	if err != nil {
-		return "", fmt.Errorf("fetching %s: %w", rawURL, err)
+		return nil, fmt.Errorf("fetching %s: %w", rawURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fetching %s: HTTP %d", rawURL, resp.StatusCode)
+		return nil, fmt.Errorf("fetching %s: HTTP %d", rawURL, resp.StatusCode)
 	}
 
-	// Preserve the original URL extension so format detection works
-	u, _ := url.Parse(rawURL)
-	ext := filepath.Ext(u.Path)
-	f, err := os.CreateTemp("", "miniflux-adder-*"+ext)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("creating temp file: %w", err)
+		return nil, fmt.Errorf("downloading %s: %w", rawURL, err)
 	}
-
-	if _, err := io.Copy(f, resp.Body); err != nil {
-		f.Close()
-		os.Remove(f.Name())
-		return "", fmt.Errorf("downloading %s: %w", rawURL, err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-
-	return f.Name(), nil
+	return data, nil
 }
 
-func readURLs(path string) ([]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
+func parseURLs(data []byte) []string {
 	var urls []string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		urls = append(urls, line)
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return urls, nil
+	return urls
 }
 
-func parseOPML(path string) ([]opmlFeed, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
+func parseOPML(data []byte) ([]opmlFeed, error) {
 	var doc opmlDocument
 	if err := xml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("parsing OPML: %w", err)
@@ -443,7 +393,7 @@ func parseOPML(path string) ([]opmlFeed, error) {
 			}
 		}
 	}
-	walk(doc.Body.Outlines, "")
+	walk(doc.Outlines, "")
 
 	return feeds, nil
 }
@@ -515,21 +465,11 @@ func printSummary(succeeded, skipped, failed int) {
 	total := succeeded + skipped + failed
 	summary := fmt.Sprintf("%d added, %d already existed, %d failed out of %d total", succeeded, skipped, failed, total)
 
+	color := lipgloss.Color("10") // green
 	if failed > 0 {
-		fmt.Println(boxStyle.BorderForeground(lipgloss.Color("9")).Render(summary))
-	} else {
-		fmt.Println(boxStyle.BorderForeground(lipgloss.Color("10")).Render(summary))
+		color = lipgloss.Color("9") // red
 	}
-}
-
-func handleRemoveAdded(filePath string, remainingURLs []string, isRemote, isOPML bool) {
-	if isRemote || isOPML {
-		return
-	}
-	if err := writeURLs(filePath, remainingURLs); err != nil {
-		fatal("updating %s: %v", filePath, err)
-	}
-	fmt.Println(dimStyle.Render(fmt.Sprintf("  Updated %s (%d URLs remaining)", filePath, len(remainingURLs))))
+	fmt.Println(boxStyle.BorderForeground(color).Render(summary))
 }
 
 func fatal(format string, args ...any) {
