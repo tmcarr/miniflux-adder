@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"encoding/xml"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,12 +13,24 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/alecthomas/kong"
 	"github.com/charmbracelet/huh/spinner"
 	"github.com/charmbracelet/lipgloss"
 	miniflux "miniflux.app/v2/client"
 )
 
 // --- Types ---
+
+var cli struct {
+	MinifluxURL    string `help:"Miniflux instance URL (env: MINIFLUX_URL)." name:"miniflux-url" placeholder:"URL"`
+	APIToken       string `help:"API token, plain text or op:// reference (env: MINIFLUX_API_TOKEN)." name:"api-token" placeholder:"TOKEN"`
+	CategoryID     *int64 `help:"Category ID for new feeds, 0 for uncategorized." name:"category-id" placeholder:"ID"`
+	OPMLCategories string `help:"OPML category handling: ignore or create (env: MINIFLUX_OPML_CATEGORIES)." name:"opml-categories" placeholder:"MODE"`
+	Config         string `help:"Path to config file." placeholder:"PATH"`
+	ListCategories bool   `help:"List available categories and exit." name:"list-categories"`
+
+	Input string `arg:"" optional:"" help:"Feed file path or URL (.txt, .opml, .xml)."`
+}
 
 type config struct {
 	MinifluxURL    string `toml:"miniflux_url"`
@@ -73,27 +84,32 @@ var (
 // --- Main ---
 
 func main() {
-	cfg, token := parseFlags()
+	kong.Parse(&cli,
+		kong.Name("miniflux-adder"),
+		kong.Description("Bulk-add RSS/Atom feeds to a Miniflux instance from a text file, OPML export, or URL."),
+		kong.UsageOnError(),
+	)
 
-	if cfg.listCategories {
-		listCategories(cfg.config, token)
+	cfg, token := resolveConfig()
+
+	if cli.ListCategories {
+		listCategories(cfg, token)
 		return
 	}
 
-	if flag.NArg() < 1 {
-		fatal("please provide a path to a file containing feed URLs")
+	if cli.Input == "" {
+		fatal("please provide a feed file path or URL")
 	}
-	input := flag.Arg(0)
 
-	filePath, cleanup := resolveInput(input)
+	filePath, cleanup := resolveInput(cli.Input)
 	if cleanup != nil {
 		defer cleanup()
 	}
 
-	isOPML := isOPMLFile(input)
+	isOPML := isOPMLFile(cli.Input)
 	client := miniflux.NewClient(cfg.MinifluxURL, token)
 
-	feeds := loadFeeds(filePath, isOPML, client, cfg.config)
+	feeds := loadFeeds(filePath, isOPML, client, cfg)
 
 	fmt.Println(headerStyle.Render("miniflux-adder"))
 	fmt.Printf("Adding %d feed(s) to %s\n\n", len(feeds), cfg.MinifluxURL)
@@ -103,7 +119,7 @@ func main() {
 	printSummary(succeeded, skipped, failed)
 
 	if cfg.RemoveAdded && len(remainingURLs) != len(feeds) {
-		handleRemoveAdded(filePath, remainingURLs, isURL(input), isOPML)
+		handleRemoveAdded(filePath, remainingURLs, isURL(cli.Input), isOPML)
 	}
 
 	if failed > 0 {
@@ -111,64 +127,36 @@ func main() {
 	}
 }
 
-// parsedFlags bundles the parsed config with the list-categories flag,
-// since that flag short-circuits before we need a feed file.
-type parsedFlags struct {
-	config
-	listCategories bool
-}
+// --- Config resolution ---
 
-func parseFlags() (parsedFlags, string) {
-	flagURL := flag.String("miniflux-url", "", "Miniflux instance URL (env: MINIFLUX_URL)")
-	flagToken := flag.String("api-token", "", "Miniflux API token (env: MINIFLUX_API_TOKEN)")
-	flagCategory := flag.Int64("category-id", 0, "Category ID for new feeds (0 = uncategorized)")
-	flagListCategories := flag.Bool("list-categories", false, "List available categories and exit")
-	flagConfig := flag.String("config", "", "Path to config file (default: $XDG_CONFIG_HOME/miniflux-adder/config.toml)")
-	flagOPMLCategories := flag.String("opml-categories", "", "OPML category handling: ignore (default) or create (env: MINIFLUX_OPML_CATEGORIES)")
-	flag.Parse()
-
-	cfg, err := loadConfig(*flagConfig)
+// resolveConfig merges configuration from all sources.
+// Precedence (highest to lowest): flags > env vars > config file > defaults.
+func resolveConfig() (config, string) {
+	fileCfg, err := loadConfig(cli.Config)
 	if err != nil {
 		fatal("%v", err)
 	}
 
-	// Env vars override config file
-	if env := os.Getenv("MINIFLUX_URL"); env != "" {
-		cfg.MinifluxURL = env
-	}
-	if env := os.Getenv("MINIFLUX_API_TOKEN"); env != "" {
-		cfg.APIToken = env
-	}
-	if env := os.Getenv("MINIFLUX_OPML_CATEGORIES"); env != "" {
-		cfg.OPMLCategories = env
+	cfg := config{
+		MinifluxURL:    coalesce(cli.MinifluxURL, os.Getenv("MINIFLUX_URL"), fileCfg.MinifluxURL),
+		APIToken:       coalesce(cli.APIToken, os.Getenv("MINIFLUX_API_TOKEN"), fileCfg.APIToken),
+		OPMLCategories: coalesce(cli.OPMLCategories, os.Getenv("MINIFLUX_OPML_CATEGORIES"), fileCfg.OPMLCategories, "ignore"),
+		RemoveAdded:    fileCfg.RemoveAdded,
 	}
 
-	// Flags override env vars
-	if *flagURL != "" {
-		cfg.MinifluxURL = *flagURL
-	}
-	if *flagToken != "" {
-		cfg.APIToken = *flagToken
-	}
-	if *flagCategory != 0 {
-		cfg.CategoryID = *flagCategory
-	}
-	if *flagOPMLCategories != "" {
-		cfg.OPMLCategories = *flagOPMLCategories
+	if cli.CategoryID != nil {
+		cfg.CategoryID = *cli.CategoryID
+	} else {
+		cfg.CategoryID = fileCfg.CategoryID
 	}
 
-	// Defaults and validation
-	if cfg.OPMLCategories == "" {
-		cfg.OPMLCategories = "ignore"
-	}
-	if cfg.OPMLCategories != "ignore" && cfg.OPMLCategories != "create" {
-		fatal("invalid opml_categories value %q (must be \"ignore\" or \"create\")", cfg.OPMLCategories)
-	}
 	if cfg.MinifluxURL == "" {
 		fatal("miniflux URL is required (use --miniflux-url, MINIFLUX_URL, or config file)")
 	}
+	if cfg.OPMLCategories != "ignore" && cfg.OPMLCategories != "create" {
+		fatal("invalid --opml-categories value %q (must be \"ignore\" or \"create\")", cfg.OPMLCategories)
+	}
 
-	// Resolve API token
 	token := cfg.APIToken
 	if strings.HasPrefix(token, "op://") {
 		fmt.Println(dimStyle.Render("Resolving API token from 1Password..."))
@@ -182,7 +170,17 @@ func parseFlags() (parsedFlags, string) {
 		fatal("API token is required (use --api-token, MINIFLUX_API_TOKEN, or config file)")
 	}
 
-	return parsedFlags{config: cfg, listCategories: *flagListCategories}, token
+	return cfg, token
+}
+
+// coalesce returns the first non-empty string.
+func coalesce(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // --- Commands ---
@@ -525,16 +523,13 @@ func printSummary(succeeded, skipped, failed int) {
 }
 
 func handleRemoveAdded(filePath string, remainingURLs []string, isRemote, isOPML bool) {
-	if isRemote {
-		fmt.Println(dimStyle.Render("  Note: remove_added is not supported for URL inputs"))
-	} else if isOPML {
-		fmt.Println(dimStyle.Render("  Note: remove_added is not supported for OPML files"))
-	} else {
-		if err := writeURLs(filePath, remainingURLs); err != nil {
-			fatal("updating %s: %v", filePath, err)
-		}
-		fmt.Println(dimStyle.Render(fmt.Sprintf("  Updated %s (%d URLs remaining)", filePath, len(remainingURLs))))
+	if isRemote || isOPML {
+		return
 	}
+	if err := writeURLs(filePath, remainingURLs); err != nil {
+		fatal("updating %s: %v", filePath, err)
+	}
+	fmt.Println(dimStyle.Render(fmt.Sprintf("  Updated %s (%d URLs remaining)", filePath, len(remainingURLs))))
 }
 
 func fatal(format string, args ...any) {

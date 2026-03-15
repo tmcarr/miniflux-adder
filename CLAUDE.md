@@ -35,7 +35,8 @@ go build
 
 ## Dependencies
 
-- `github.com/BurntSushi/toml` - Config parsing
+- `github.com/alecthomas/kong` - CLI argument parsing
+- `github.com/BurntSushi/toml` - Config file parsing
 - `github.com/charmbracelet/huh/spinner` - Progress spinners
 - `github.com/charmbracelet/lipgloss` - Terminal styling
 - `miniflux.app/v2/client` - Miniflux API client
