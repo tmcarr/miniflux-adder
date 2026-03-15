@@ -15,7 +15,7 @@ api_token = "your-api-token-here"
 category_id = 0
 
 # Remove successfully added and duplicate URLs from the feeds file
-# (not supported for OPML files)
+# (not supported for OPML or URL inputs)
 remove_added = false
 
 # OPML category handling when importing .opml/.xml files:
